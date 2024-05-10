@@ -1,0 +1,3 @@
+# Add the executables
+add_executable(individual_assignment individual_assignment)
+target_link_libraries(individual_assignment platform)
