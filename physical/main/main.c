@@ -14,19 +14,26 @@
 #include "esp_wifi.h"
 #include "mqtt_client.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include <stdio.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 
-#define SAMPLE_HARDCODED 1
+#define MEASURE_RTT 1
+
+#define DEBUG_PRINT_WINDOW 0
 
 #define NUM_FFT_SAMPLES 256
-#define INITIAL_SAMPLE_FREQ 500
+#define INITIAL_SAMPLE_FREQ 1000
 #define THRESHOLD_MULTIPLIER 0.1f
 
 #define MAX_MQTT_SIZE 100
+#define MQTT_QOS 2
+#define RTT_AVERAGE_NUM 100
+#define WINDOW_SIZE 5
 
+// Use unions to be able to store imaginary numbers in both rectangular and polar coordinates
 typedef struct
 {
     union
@@ -47,12 +54,12 @@ const char *MQTT_TAG = "MQTT";
 
 const char *ssid = "OnePlus Nord"; // WiFi credentials here
 const char *pass = "ayylmao123";
-SemaphoreHandle_t xSemaphoreWifiConnected;
+SemaphoreHandle_t xSemaphoreWifiConnected = NULL;
 
 esp_mqtt_client_handle_t client;
 int mqtt_connected = 0;
-const char *mqtt_topic = "aggregate";
-const char *mqtt_uri = "mqtts://192.168.24.26";
+char *mqtt_topic = "aggregate";
+const char *mqtt_uri = "mqtts://192.168.58.26";
 const int mqtt_port = 1883;
 const char *root_ca_cert = "-----BEGIN CERTIFICATE-----\n"
                            "MIIEFTCCAv2gAwIBAgIUKH9dBq33UzvB80dnEQT5TZPBmLgwDQYJKoZIhvcNAQEL\n"
@@ -131,37 +138,38 @@ const char *privkey = "-----BEGIN PRIVATE KEY-----\n"
                       "-----END PRIVATE KEY-----\n";
 const char *client_id = "";
 
-#if SAMPLE_HARDCODED == 0
-static float sensor_value;
+#if MEASURE_RTT
+SemaphoreHandle_t xSemaphoreMQTTReceived = NULL;
 #endif
-static bool started_receiving = 1;
+
+char json_send[MAX_MQTT_SIZE];
+char json_recv[MAX_MQTT_SIZE];
 
 static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
     static int retry_num = 0;
 
-    if (event_id == WIFI_EVENT_STA_START)
+    switch (event_id)
     {
-        printf("WIFI CONNECTING....\n");
-    }
-    else if (event_id == WIFI_EVENT_STA_CONNECTED)
-    {
-        printf("WiFi CONNECTED\n");
-    }
-    else if (event_id == WIFI_EVENT_STA_DISCONNECTED)
-    {
-        printf("WiFi lost connection\n");
+    case WIFI_EVENT_STA_START:
+        ESP_LOGI(WIFI_TAG, "CONNECTING....\n");
+        break;
+    case WIFI_EVENT_STA_CONNECTED:
+        ESP_LOGI(WIFI_TAG, "CONNECTED\n");
+        break;
+    case WIFI_EVENT_STA_DISCONNECTED:
+        ESP_LOGI(WIFI_TAG, "LOST CONNECTION\n");
         if (retry_num < 5)
         {
             esp_wifi_connect();
             retry_num++;
-            printf("Retrying to Connect...\n");
+            ESP_LOGI(WIFI_TAG, "Retrying to Connect...\n");
         }
-    }
-    else if (event_id == IP_EVENT_STA_GOT_IP)
-    {
+        break;
+    case IP_EVENT_STA_GOT_IP:
+        ESP_LOGI(WIFI_TAG, "Got IP...\n\n");
         xSemaphoreGive(xSemaphoreWifiConnected);
-        printf("Wifi got IP...\n\n");
+        break;
     }
 }
 
@@ -191,19 +199,32 @@ void wifi_init()
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data)
 {
     esp_mqtt_event_handle_t event = event_data;
-    if (event->event_id == MQTT_EVENT_CONNECTED)
+
+    switch (event->event_id)
     {
+    case MQTT_EVENT_CONNECTED:
         ESP_LOGI(MQTT_TAG, "MQTT_EVENT_CONNECTED");
+        esp_mqtt_client_subscribe(client, mqtt_topic, MQTT_QOS);
         mqtt_connected = 1;
-    }
-    else if (event->event_id == MQTT_EVENT_DISCONNECTED)
-    {
+        break;
+    case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(MQTT_TAG, "MQTT_EVENT_DISCONNECTED");
         mqtt_connected = 0;
-    }
-    else if (event->event_id == MQTT_EVENT_ERROR)
-    {
-        ESP_LOGD(MQTT_TAG, "MQTT_EVENT_ERROR");
+        break;
+    case MQTT_EVENT_DATA:
+        ESP_LOGI(MQTT_TAG, "DATA RECEIVED");
+        memcpy((uint8_t *)json_recv + event->current_data_offset, event->data, event->data_len);
+#if MEASURE_RTT
+        // If round trip has been completed, signal the average task
+        if (event->current_data_offset + event->data_len == event->total_data_len)
+            xSemaphoreGive(xSemaphoreMQTTReceived);
+#endif
+        break;
+    case MQTT_EVENT_ERROR:
+        ESP_LOGE(MQTT_TAG, "MQTT_EVENT_ERROR");
+        break;
+    default:
+        break;
     }
 }
 
@@ -290,15 +311,17 @@ float *generate_hann_window(int N)
     return hann_window;
 }
 
-inline float sine(float A, float f, float t)
+static inline float sine(float A, float f, float t)
 {
-    return A * sinf(2 * M_PI * f * t);
+    // To make the sin function harder and overall more uniform to compute
+    // across the input variables
+    return A * sinf((2 * M_PI * INITIAL_SAMPLE_FREQ) + 2 * M_PI * f * t);
 }
 
-inline float sample_signal(float t)
+static inline float sample_signal(float t)
 {
     // !!! Change this to change signal if using hardcoded mode
-    return sine(1, 10, t);
+    return sine(5, 500, t);
 }
 
 void generate_signal(int N, float sample_freq, complex *signal)
@@ -340,7 +363,7 @@ float sample_signal_get_max_freq(int num_samples, float sample_freq)
     {
         signal[i].Mag = sqrtf(signal[i].Re * signal[i].Re + signal[i].Im * signal[i].Im);
         // Consider only first half of FFT (positive frequencies, before Nyquist) since
-        // that is the maximum frequency that can be effectively and correctly resolved by the fft
+        // the second half is just a mirror of the first half (negative frequency responses)
         if (i < num_samples / 2 && signal[i].Mag > max_mag)
         {
             max_mag = signal[i].Mag;
@@ -369,18 +392,17 @@ void sample_and_send_averages(float sample_freq, int window_size)
 {
     float sum = 0.f;
     int num_window = 0, cur_window_ind = 0;
-    float *window = (float *)malloc(window_size);
-    static char json[MAX_MQTT_SIZE];
+    float *window = (float *)malloc(window_size * sizeof(float));
+#if MEASURE_RTT
+    float rtt_avg_seconds = 0.f;
+    int rtt_avg_count = 0;
+#endif
 
     float cur_time = 0.f;
 
     while (1)
     {
-#if SAMPLE_HARDCODED
         float v = sample_signal(cur_time);
-#else
-        float v = sensor_value;
-#endif
         sum += v;
         if (num_window < window_size)
             num_window++;
@@ -389,19 +411,37 @@ void sample_and_send_averages(float sample_freq, int window_size)
         window[cur_window_ind] = v;
         cur_window_ind = (cur_window_ind + 1) % window_size;
 
+#if DEBUG_PRINT_WINDOW
         printf("Window: [");
         for (int i = 0; i < num_window; i++)
             printf("%f ", window[i]);
         printf("]\n");
         printf("Average: %f\n", sum / num_window);
+#endif
 
         // Send average to MQTT
         if (num_window == window_size)
         {
             float avg = sum / window_size;
-            snprintf(json, MAX_MQTT_SIZE, "{\"average\": %f}", avg);
-            int msg_id = esp_mqtt_client_publish(client, mqtt_topic, json, 0, 1, 0);
-            ESP_LOGI(APP_TAG, "Published average to MQTT, msg_id=%d", msg_id);
+            snprintf(json_send, MAX_MQTT_SIZE, "{\"average\": %f}", avg);
+            int64_t t = esp_timer_get_time();
+            int msg_id = esp_mqtt_client_publish(client, mqtt_topic, json_send, 0, MQTT_QOS, 0);
+#if MEASURE_RTT
+            xSemaphoreTake(xSemaphoreMQTTReceived, portMAX_DELAY);
+            int64_t rtt = esp_timer_get_time() - t;
+            ESP_LOGI(MQTT_TAG, "MSG %d, round trip time=%fs, delay=%fs", msg_id, rtt / 1e6f, rtt / 2e6f);
+            rtt_avg_seconds += rtt / 1e6f;
+            rtt_avg_count++;
+            if (rtt_avg_count == RTT_AVERAGE_NUM)
+            {
+                rtt_avg_seconds /= RTT_AVERAGE_NUM;
+                ESP_LOGW(MQTT_TAG, "AVERAGE DELAY OVER %d SENDS: %fs", rtt_avg_count, rtt_avg_seconds / 2.f);
+                rtt_avg_seconds = 0.f;
+                rtt_avg_count = 0;
+            }
+#else
+            ESP_LOGI(APP_TAG, "MSG %d", msg_id);
+#endif
         }
 
         vTaskDelay(configTICK_RATE_HZ / sample_freq);
@@ -413,9 +453,6 @@ static void individual_assignment(void *param)
 {
     float sample_freq = INITIAL_SAMPLE_FREQ;
 
-    while (!started_receiving)
-        vTaskDelay(0); // otherwise compiler turns this into infinite loop it seems
-
     printf("STARTED RECEIVING SIGNAL\n");
     printf("INITIAL SAMPLING RATE IS %d\n", INITIAL_SAMPLE_FREQ);
     printf("CONFIG TICKRATE IS %d\n", configTICK_RATE_HZ);
@@ -426,12 +463,15 @@ static void individual_assignment(void *param)
     sample_freq = 2.f * max_frequency;
     printf("MAX FREQUENCY IS %fHz, SAMPLE RATE SET TO %fHz\n", max_frequency, sample_freq);
 
-    sample_and_send_averages(sample_freq, 5);
+    sample_and_send_averages(sample_freq, WINDOW_SIZE);
 }
 
 void app_main(void)
 {
     xSemaphoreWifiConnected = xSemaphoreCreateBinary();
+#if MEASURE_RTT
+    xSemaphoreMQTTReceived = xSemaphoreCreateBinary();
+#endif
     // WiFi
     nvs_flash_init();
     wifi_init();

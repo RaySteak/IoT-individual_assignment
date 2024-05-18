@@ -4,8 +4,12 @@ import numpy as np
 import struct
 import sys
 import threading
+import os
 
-HOST = "m3-95.grenoble.iot-lab.info"
+node_id = os.environ['NODE_ID']
+
+HOST = f"m3-{node_id}.grenoble.iot-lab.info"
+print(HOST)
 PORT = 20000
 
 SEND_RATE = 2000

@@ -1,0 +1,5 @@
+sine(1, 1): measured 3.906250Hz, set to 7.8125Hz
+sine(1, 10) + sine(0.1, 100): measured 101.562500Hz, set to 203.125000Hz
+sine(1, 10): measured 15.625000Hz, set to 31.250000Hz
+sine(1, 100): measured 105.468750Hz, set to 210.937500Hz
+sine(5, 500): measured 488.281250Hz, set to 976.562500Hz

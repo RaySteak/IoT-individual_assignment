@@ -1,39 +1,30 @@
 # Individual Assignment, IoT 2024
 Adrian Gheorghiu - 2162607
-## Implementation details
-Initially, I implemented the task on IoT-LAB, because it offers
-power draw measurement tools
 
-Both sending the data real-time from a python script through UART and
-hardcoding the signal were implemented for IoT-LAB
-- First method (real-time UART/TCP) observations:
-    - We have to decide on a sending frequency.
-    - We notice that we have to introduce a delay between flashing the board
-      and starting to send the signal otherwise the board misses the initial bytes sent.
-    - At first, I tried to do print it to STDOUT and pipe it through netcat(nc),
-      but the results where really bad and the sampled signal looks very blocky. It had
-      nothing to do with the network delay inconsistency, but rather the fact that
-      netcat uses Nagle's alglorithm which introduces delay into the TCP sends
-      and waits for data to accumulate to send bigger packets at once. To fix this,
-      the connection had to be made through sockets directly with the TCP option
-      TCP_NODELAY set to true.
-- Second method (hardcoded signal) observations:
-    - Even with the hardcoded signal, FFT result is not perfect due to spectral
-      leakage (from sampling incomplete period). In fact, the results are very similar
-      to that of the first method.
+I implemented the task in both IoT-LAB (the part with power measurement) and on the physical board (for virtually everything else). Problem with IoT-LAB is that there is no MQTT library and also the nodes seem isolated with the only method of communication being through the TCP broker that sends the message through UART. Hence why, I also implemented it for the physical device, where I have MQTT but no power draw measurement tool. To keep it simple, for the physical device I only implemented the hardcoded version.
 
-Problem with IoT-LAB is that there is no MQTT library and also the nodes seem
-isolated with the only method of communication being through the TCP broker that sends
-the message through UART. Hence why, I also implemented it for the physical device,
-where I have MQTT but no power draw measurement tool. To keep it simple, for the
-physical device I only implemented the hardcoded version.
+## 1. Signal generation
+### 1.1 IoT-LAB TCP UART
+Initially, I implemented this method on IoT-LAB by using the UART character RX handler and reading bytes until they form a complete float value (data is assumed to be received in little endian form), which is every 4 bytes. This way, the bytes are first accumulated in an auxiliary variable and then copied over in a global variable called "sensor_value" which represents the updated sensor value. Incomplete reads of the variable (for example reading half of the old value and half of a new value) are impossible in this scenario as both the IoT-LAB M3 and ESP32 microprocessors are 32-bit and guarantee atomicity of all 32 bit variables. The data race is not a problem, since, worst case, the old sensor value is read just before update of the new value in memory. Some problems with this method include having to decide on a frequency the values are sent at (in theory it should be double then the maximum frequency the board samples at) and also that a delay must be introduced between starting the experiment and sending the values, otherwise the board might miss a couple of bytes and then all following float values will be corrupted (unless the missed number of bytes is divisible by the size of the float).
 
-Physical device implementation observations:
+With this method I ran into another interesting problem. I first tried printing the generated signal to STDOUT (in a python program, of course) and then piping it through netcat (nc), but the results ended up being very bad with the received signal looking very blocky. I first chalked it up to network delay inconsistencies, but it turned out that the problem was not intrinsic to the network itself, but it was due to Nagle's algorithm, which introduces delay into the TCP sends and waits for data to accumulate to send bigger packets at once. The netcat utility has this algorithm enabled by default, so the connection had to be made through sockets directly with the TCP option TCP_NODELAY set to true to disable Nagle's algorithm.
 
-- By default, FreeRTOS tickrate is set to 100Hz. I increased it to 1kHz to be able
-to achieve 1kHz sample rate. I could in theory use timers but for the sake of keeping
-the code simple, I decided not to.
-- For the aggregate, an optimised rolling window average of the signal is calculated
-- For MQTT, I use a secure Mosquitto MQTTS server running on my laptop, with RSA keys and
-  certificates for the CA, server, and client generated using OpenSSL locally. I don't
-  use any authentication method, so clients are anonymous.
+### 1.2 Hardcoded signal
+This version was the one used for all experiments, as it works better with the power measurement tools on IoT-LAB and is much easier to implement on the physical board than reading values from TCP or UART. The signal can be defined in the "sample_signal" function as a sum of "sine" functions. The sine function samples a sinusoid of amplitude "A" and frequency "f" at time "t", according to the following formula: $$ A\ sin(2 \pi f t) $$
+During power consumption experiments, I noticed that, at a constant sample frequency, different input frequencies would yield different power consumptions. This is because the math.h "sinf" function is implemented in through branches which are chosen based on how big the input number is. Thus, for small input numbers, the function is way faster than for big numbers. To fix that, I shifted the sine input by the initial maximum sample frequency so that, regardless of frequency, all samples will be taken from roughly the same order of magnitude: $$ A\ sin(2 \pi \times INITIAL\_SAMPLE\_FREQ \ + 2\pi f t) $$
+This hardcoded version showed similar results to the previous version, so there was no improvement that came with having the signal instantly available.
+
+## 2. Maximum sampling frequency
+For sampling the signal at a given frequency, I made use of the vTaskDelay RTOS function that delays the current task for a given amount of ticks. At every system tick, FreeRTOS checks whether any task needs to be woken up, so a higher tickrate means more work for the server, so the limit that the tickrate can be set in the esp-idf config is 1000Hz. FreeRTOS ticks are used to measure real time as well, so the timer interrupt that increments the ticks is made with strict temporal accuracy in mind, which means it's somewhat reliable for sampling. The default tickrate for FreeRTOS in esp-idf is 100Hz. I increased it to the maximum resolution of 1000Hz by changing the value of the config variable "CONFIG_FREERTOS_HZ". This gives us a maximum sampling frequency of 1000Hz. For the sake of simplicity, I chose this method to emulate sampling from an actual ADC and thus set the default initial sampling frequency to 1kHz in the code. A more complex method would have been to use a hardware timer with a small prescaler value to really achieve very high frequencies, but for experimental purposes the vTaskDelay method will make do.
+
+## 3. Identifying optimal sampling frequency
+For the FFT, I snatched an FFT implementation from [this](https://www.math.wustl.edu/~victor/mfmm/fourier/fft.c) link and I modified the definition for the complex numbers to also accommodate representing the numbers in polar coordinates. This was achieved using C unions. A couple of things to notice about this basic FFT implementation is that it only works for inputs which are a power of 2 and also that it is less efficient because it does superfluous copies of the signal (which could be avoided with a bit reverse trick for example). For getting the maximum frequency that is present in the signal, I first apply the FFT on 256 sampled values (which will give us a 3.90625Hz bin resolution with the 1000Hz initial sampling rate) and extract the magnitude from the result. I then find the dominant frequency magnitude by getting the largest value out of all magnitudes in the first half of the FFT. After that, I find the rightmost frequency in the first half that has a magnitude at least that of the dominant frequency's times some multiplier (chosen as 0.1 by default). The search is done only in the first half because the second half represents the negative frequency responses and in the case of real input signals, it is a mirror of the first half. The maximum frequency is found using a threshold (dominant frequency magnitude times a multiplier) because even the bins of the frequencies not found in the signal will be non-zero due to spectral leakage (from sampling incomplete periods of the signal) and rounding errors.
+
+## 4. Computing and sending aggregate
+This part is done only in physical board implementation. Once the sampling frequency has been adjusted to twice the maximum frequency, the aggregates of the samples are computed as the average over a rolling window (with 5 samples per window as the default value). Once an average is computed, it is sent through MQTTS to a mosquitto server running on the edge (my laptop). The connection is secured through TLS, with certificates and RSA keys generated locally using OpenSSL for the Certificate Authority, server, and client. No authentication method is used, so clients are anonymous.
+
+## 5. Measuring the performance of the system
+### 5.1 Energy savings
+This part is done only in the IoT-LAB implementation. To measure power draw, I used the IoT-LAB power consumption monitoring tool. I do this by running a 2-minute experiment with a code that samples for 30 seconds at the initial maximum frequency, applies FFT to get the maximum frequency and then samples again for 30 seconds at the new adjusted frequency. After that, the "plot_oml_consum" tool is used to get a plot of power consumption over time.
+### 5.2 Volume of data transmitted over the network
+### 5.3 Latency

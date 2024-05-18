@@ -20,10 +20,10 @@
 
 #include "queue.h"
 
-#define SAMPLE_HARDCODED 0
+#define SAMPLE_HARDCODED 1
 
 #define NUM_FFT_SAMPLES 256
-#define INITIAL_SAMPLE_FREQ 500
+#define INITIAL_SAMPLE_FREQ 1000
 #define THRESHOLD_MULTIPLIER 0.1f
 
 typedef struct
@@ -112,7 +112,7 @@ void fft(complex *v, int n, complex *tmp)
     return;
 }
 
-inline float hann(int i, int N)
+static inline float hann(int i, int N)
 {
     return 0.5f * (1.f - cos(2 * M_PI * i / (N - 1)));
 }
@@ -132,9 +132,17 @@ float *generate_hann_window(int N)
     return hann_window;
 }
 
-inline float sine(float A, float f, float t)
+static inline float sine(float A, float f, float t)
 {
-    return A * sinf(2 * M_PI * f * t);
+    // To make the sin function harder and overall more uniform to compute
+    // across the input variables
+    return A * sinf((2 * M_PI * INITIAL_SAMPLE_FREQ) + 2 * M_PI * f * t);
+}
+
+static inline float sample_signal(float t)
+{
+    // !!! Change this to change signal if using hardcoded mode
+    return sine(1, 1, t);
 }
 
 void generate_signal(int N, float sample_freq, complex *signal)
@@ -143,8 +151,7 @@ void generate_signal(int N, float sample_freq, complex *signal)
     for (i = 0; i < N; i++)
     {
         float t = i / sample_freq;
-        // !!! Change this to change signal if using hardcoded mode
-        signal[i].Re = sine(1, 10, t);
+        signal[i].Re = sample_signal(t);
         //
         signal[i].Im = 0.f;
     }
@@ -186,7 +193,7 @@ float sample_signal_get_max_freq(int num_samples, float sample_freq)
     {
         signal[i].Mag = sqrtf(signal[i].Re * signal[i].Re + signal[i].Im * signal[i].Im);
         // Consider only first half of FFT (positive frequencies, before Nyquist) since
-        // that is the maximum frequency that can be effectively and correctly resolved by the fft
+        // the second half is just a mirror of the first half (negative frequency responses)
         if (i < num_samples / 2 && signal[i].Mag > max_mag)
         {
             max_mag = signal[i].Mag;
@@ -211,26 +218,36 @@ float sample_signal_get_max_freq(int num_samples, float sample_freq)
     return (sample_freq / (float)num_samples) * max_freq_ind;
 }
 
-void sample_and_send_averages(float sample_freq, int window_size)
+void sample_for_seconds(float sample_freq, float seconds)
 {
+    const int window_size = 5;
     float sum = 0.f;
     int num_window = 0, cur_window_ind = 0;
-    float *window = (float *)malloc(window_size);
+    float *window = (float *)malloc(window_size * sizeof(float));
+    float cur_seconds = 0.f;
 
-    while (1)
+    printf("SAMPLING SIGNAL FOR %f seconds at frequency %f...\n", seconds, sample_freq);
+
+    while (cur_seconds < seconds)
     {
+#if SAMPLE_HARDCODED
+        float v = sample_signal(cur_seconds);
+#else
         float v = sensor_value;
+#endif
         sum += v;
         if (num_window < window_size)
             num_window++;
         else
-            sum -= window[cur_window_ind] window[cur_window_ind] = v;
+            sum -= window[cur_window_ind];
+        window[cur_window_ind] = v;
         cur_window_ind = (cur_window_ind + 1) % window_size;
 
-        // Send average to MQTT
-
         vTaskDelay(configTICK_RATE_HZ / sample_freq);
+        cur_seconds += 1.f / sample_freq;
     }
+    free(window);
+    printf("DONE SAMPLING!\n");
 }
 
 static void app_task(void *param)
@@ -238,9 +255,11 @@ static void app_task(void *param)
     float sample_freq = INITIAL_SAMPLE_FREQ;
 
     while (!started_receiving)
-        vTaskDelay(0); // otherwise compiler turns this into infinite loop it seems
-
+        vTaskDelay(0); // Otherwise compiler turns this into infinite loop it seems
     printf("STARTED RECEIVING SIGNAL\n");
+
+    sample_for_seconds(sample_freq, 30);
+
     printf("INITIAL SAMPLING RATE IS %d\n", INITIAL_SAMPLE_FREQ);
     printf("CONFIG TICKRATE IS %d\n", configTICK_RATE_HZ);
     printf("\n");
@@ -250,8 +269,8 @@ static void app_task(void *param)
     sample_freq = 2.f * max_frequency;
     printf("MAX FREQUENCY IS ~%dHz, SAMPLE RATE SET TO ~%dHz\n", (int)max_frequency, (int)sample_freq);
 
-    while (true)
-        ;
+    sample_for_seconds(sample_freq, 30);
+    vTaskDelete(0);
 }
 
 int main()
