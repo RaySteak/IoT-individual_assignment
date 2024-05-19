@@ -210,12 +210,16 @@ static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_
     case MQTT_EVENT_DISCONNECTED:
         ESP_LOGI(MQTT_TAG, "MQTT_EVENT_DISCONNECTED");
         mqtt_connected = 0;
+#if MEASURE_RTT
+        // To prevent deadlock if the MQTT client disconnects while waiting for a response
+        xSemaphoreGive(xSemaphoreMQTTReceived);
+#endif
         break;
     case MQTT_EVENT_DATA:
         ESP_LOGI(MQTT_TAG, "DATA RECEIVED");
         memcpy((uint8_t *)json_recv + event->current_data_offset, event->data, event->data_len);
 #if MEASURE_RTT
-        // If round trip has been completed, signal the average task
+        // If round trip has been completed, signal the aggregate task
         if (event->current_data_offset + event->data_len == event->total_data_len)
             xSemaphoreGive(xSemaphoreMQTTReceived);
 #endif
@@ -321,7 +325,7 @@ static inline float sine(float A, float f, float t)
 static inline float sample_signal(float t)
 {
     // !!! Change this to change signal if using hardcoded mode
-    return sine(5, 500, t);
+    return sine(1, 100, t);
 }
 
 void generate_signal(int N, float sample_freq, complex *signal)
@@ -397,6 +401,20 @@ void sample_and_send_averages(float sample_freq, int window_size)
     float rtt_avg_seconds = 0.f;
     int rtt_avg_count = 0;
 #endif
+    // Assume that the aggregate value has at most 10 characters:
+    // 6 for the decimal part, 1 for the sign, 1 for the dot, 2 for the integer part
+    // Could be more than 10 characters if aggregate value is 1000 or above
+    // or -100 or below
+    const char json_format_string[] = "{\"average\": %10.6f}"; // pad to 10 characters, 6 decimal places
+    const int float_print_size = 10;
+    int json_overhead = strlen(json_format_string) - 6; // subtract the format specifier length
+    int total_message_length = float_print_size + json_overhead;
+
+    float initial_volume_bps = INITIAL_SAMPLE_FREQ * total_message_length * 8;
+    float adjusted_volume_bps = sample_freq * total_message_length * 8;
+    printf("WITH INITIAL FREQUENCY, DATA VOLUME TRANSMITTED OVER NETWORK IS %fb/s\n", initial_volume_bps);
+    printf("WITH ADJUSTED FREQUENCY, DATA VOLUME TRANSMITTED OVER NETWORK IS %fb/s\n", adjusted_volume_bps);
+    printf("WITH ADJUSTED FREQUENCY, DATA VOLUME IS %f times smaller\n", initial_volume_bps / adjusted_volume_bps);
 
     float cur_time = 0.f;
 
@@ -412,7 +430,7 @@ void sample_and_send_averages(float sample_freq, int window_size)
         cur_window_ind = (cur_window_ind + 1) % window_size;
 
 #if DEBUG_PRINT_WINDOW
-        printf("Window: [");
+        printf("Window: [ ");
         for (int i = 0; i < num_window; i++)
             printf("%f ", window[i]);
         printf("]\n");
@@ -420,10 +438,10 @@ void sample_and_send_averages(float sample_freq, int window_size)
 #endif
 
         // Send average to MQTT
-        if (num_window == window_size)
+        if (num_window == window_size && mqtt_connected)
         {
             float avg = sum / window_size;
-            snprintf(json_send, MAX_MQTT_SIZE, "{\"average\": %f}", avg);
+            snprintf(json_send, MAX_MQTT_SIZE, json_format_string, avg);
             int64_t t = esp_timer_get_time();
             int msg_id = esp_mqtt_client_publish(client, mqtt_topic, json_send, 0, MQTT_QOS, 0);
 #if MEASURE_RTT
@@ -453,7 +471,6 @@ static void individual_assignment(void *param)
 {
     float sample_freq = INITIAL_SAMPLE_FREQ;
 
-    printf("STARTED RECEIVING SIGNAL\n");
     printf("INITIAL SAMPLING RATE IS %d\n", INITIAL_SAMPLE_FREQ);
     printf("CONFIG TICKRATE IS %d\n", configTICK_RATE_HZ);
     printf("\n");
@@ -462,6 +479,7 @@ static void individual_assignment(void *param)
     printf("\n");
     sample_freq = 2.f * max_frequency;
     printf("MAX FREQUENCY IS %fHz, SAMPLE RATE SET TO %fHz\n", max_frequency, sample_freq);
+    printf("\n");
 
     sample_and_send_averages(sample_freq, WINDOW_SIZE);
 }

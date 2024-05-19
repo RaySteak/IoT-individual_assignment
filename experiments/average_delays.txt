@@ -9,7 +9,7 @@ sine(5, 500): 0.033133s
 
 Explanation for overall decrease: every 10 values or so there is a big delay,
 but all the other values are up to par with the other sines. This suggests that the
-mosquitto server has some weird optimization thing depending on the rate at which
+mosquitto server has some weird optimization tactic depending on the rate at which
 it receives messages. For 500Hz signal (sending at 1000Hz), the MQTT server
 seems to behave more or less the same way as for 100Hz signal (sending at 200Hz).
 From 100Hz to 500Hz, there actually seems to be a small increase even,
